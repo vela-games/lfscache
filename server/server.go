@@ -26,7 +26,9 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/saracen/lfscache/cache"
+	"github.com/saracen/lfscache/exporter"
 )
 
 // BatchResponse represents a batch response payload.
@@ -87,12 +89,13 @@ func DefaultObjectBatchActionURLRewriter(href *url.URL) *url.URL {
 
 // Server is a LFS caching server.
 type Server struct {
-	logger   log.Logger
-	upstream *url.URL
-	mux      *http.ServeMux
-	cache    *cache.FilesystemCache
-	client   *http.Client
-	hmacKey  [64]byte
+	logger        log.Logger
+	upstream      *url.URL
+	mux           *http.ServeMux
+	cache         *cache.FilesystemCache
+	promCollector *exporter.LFSCacheCollector
+	client        *http.Client
+	hmacKey       [64]byte
 
 	ObjectBatchActionURLRewriter func(href *url.URL) *url.URL
 }
@@ -132,6 +135,7 @@ func newServer(logger log.Logger, upstream, directory string, cacheEnabled bool)
 				ExpectContinueTimeout: 1 * time.Second,
 			},
 		},
+		promCollector:                exporter.NewCollector(),
 		ObjectBatchActionURLRewriter: DefaultObjectBatchActionURLRewriter,
 	}
 
@@ -155,6 +159,7 @@ func newServer(logger log.Logger, upstream, directory string, cacheEnabled bool)
 	} else {
 		s.mux.Handle(ContentCachePathPrefix, s.nocache())
 	}
+	s.mux.Handle("/metrics", promhttp.Handler())
 	s.mux.Handle("/objects/batch", s.batch())
 	s.mux.Handle("/", s.proxy())
 
@@ -340,6 +345,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 
 	level.Info(s.logger).Log("event", "serving", "oid", oid, "source", source)
 	defer func() {
+		s.promCollector.CacheLatency.With("source", string(source)).Observe(float64(time.Since(begin) / time.Millisecond))
+		s.promCollector.Source.With("type", string(source)).Add(1)
 		logger := log.With(s.logger, "event", "served", "oid", oid, "source", source, "took", time.Since(begin))
 		if err != nil {
 			level.Error(logger).Log("err", err)
@@ -403,7 +410,7 @@ func (s *Server) fetch(w io.Writer, oid, url string, size int, header http.Heade
 	var beginTransfer time.Time
 	defer func() {
 		rate := formatByteRate(uint64(hcw.n), time.Since(beginTransfer))
-
+		s.promCollector.TransferRate.Set(float64(hcw.n))
 		logger := log.With(s.logger, "event", "fetched", "oid", oid, "took", time.Since(begin), "downloaded", fmt.Sprintf("%d/%d", hcw.n, size), "rate", rate)
 		if err != nil {
 			level.Error(logger).Log("err", err)
